@@ -1,0 +1,49 @@
+# Base training configuration - override per experiment
+model:
+  name: "LiquidAI/LFM2.5-350M-Base"
+  max_seq_length: 2048
+  load_in_4bit: true
+  dtype: "bfloat16"   # null = auto-detect
+
+lora:
+  r: 16
+  alpha: 16
+  dropout: 0.0
+  bias: "none"
+  # LFM2 target modules (hybrid attention + SSM projections)
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - out_proj
+    - in_proj
+    - w1
+    - w2
+    - w3
+
+training:
+  method: "sft"   # sft | dpo | grpo
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 4
+  warmup_steps: 10
+  max_steps: 200       # set to -1 to use num_train_epochs
+  num_train_epochs: 1  # used only when max_steps == -1
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  lr_scheduler_type: "cosine"
+  optim: "adamw_8bit"
+  bf16: true
+  fp16: false
+  gradient_checkpointing: "unsloth"
+  logging_steps: 10
+  save_steps: 100
+  eval_steps: 100
+  output_dir: "outputs"
+
+# Generic data-loader knobs (domain-agnostic). The dataset itself, and its
+# task framing (system prompt / input label), are NOT configured here - they
+# come from the generated data dir, selected at the CLI via `--data`.
+dataset:
+  val_split: 0.1
+  seed: 42
+  num_proc: 2

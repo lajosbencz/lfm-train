@@ -1,0 +1,25 @@
+# agent / editor
+.claude/*
+!.claude/settings.json
+!.claude/skills/
+!.claude/commands/
+
+# generated artifacts, reproducible from committed source (root-anchored so the
+# src/lfm_train/data package is NOT ignored):
+#   /data/    via `make dataset` (from domains/*.yaml)
+#   /outputs/ via `make benchmark`
+/data/
+/outputs/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+
+# caches (unsloth compiled kernels, etc.)
+*cache
+cache*
+
+# secrets
+*.env
+.env*

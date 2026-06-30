@@ -1,0 +1,46 @@
+# PromQL query optimization -- SFT experiment (SmolLM2-360M, Apache-2.0 baseline)
+# Smallest model in the sweep (300-500M class). True base checkpoint with no
+# shipped chat_template -- dataset/evaluate fall back to a minimal ChatML
+# shell (see lfm_train.dataset.ensure_chat_template) whose turns end on the
+# tokenizer's own (already well-trained) eos_token, so no modules_to_save is
+# needed to learn a stop signal.
+
+model:
+  name: "HuggingFaceTB/SmolLM2-360M"
+  max_seq_length: 512
+  load_in_4bit: true
+  dtype: "bfloat16"
+
+lora:
+  r: 48
+  alpha: 48
+  dropout: 0.0
+  bias: "none"
+  # Llama-family dense attention + standard SwiGLU MLP naming
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+training:
+  method: "sft"
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 2
+  warmup_steps: 20
+  max_steps: -1
+  num_train_epochs: 6
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  lr_scheduler_type: "cosine"
+  optim: "adamw_8bit"
+  bf16: true
+  fp16: false
+  gradient_checkpointing: "unsloth"
+  logging_steps: 5
+  save_steps: 30
+  eval_steps: 30
+  output_dir: "outputs/smollm2-360m"

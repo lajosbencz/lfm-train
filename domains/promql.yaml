@@ -1,0 +1,611 @@
+# PromQL query-optimization domain spec.
+#
+# Held-out generalization: `train` and `eval` vocab lists are DISJOINT for
+# metric/job/namespace/recording-rule dims. The eval set samples metrics the
+# model never saw in training, so accuracy there reflects learned transforms
+# rather than memorized tokens. `shared` dims are structural tokens (windows,
+# quantiles, aggregation functions) that legitimately appear in both.
+#
+# Placeholders: {{ dim }} for scalars, {{ dim.field }} for structured entries.
+# Each dim is sampled once per example, so {{ m.name }} and {{ m.rr }} agree.
+
+config:
+  seed: 42
+  eval_seen_per_pattern: 1
+
+# Task framing for training + inference. Lives with the domain (not in
+# configs/, which are model-only). `gen-dataset` copies this into the data dir
+# next to the JSONL so training and serving reproduce the exact prompt.
+prompt:
+  input_label: "Query"
+  system_prompt: >-
+    You are a PromQL optimization expert. Given a PromQL expression and an
+    instruction, rewrite the expression according to the instruction. Output
+    only the improved PromQL expression, no explanation.
+
+vocab:
+  # -- held-out: plain metrics (no recording rule) --------------------------
+  metric:
+    train:
+      - http_requests_total
+      - node_cpu_seconds_total
+      - container_memory_working_set_bytes
+      - kubelet_running_pods
+      - process_resident_memory_bytes
+      - go_goroutines
+      - kube_pod_status_ready
+      - node_network_receive_bytes_total
+    eval:
+      - kafka_consumer_records_total
+      - redis_commands_processed_total
+      - nginx_connections_active
+      - jvm_threads_current
+      - postgres_rows_fetched_total
+      - rabbitmq_queue_messages
+      - elasticsearch_indexing_total
+      - mysql_threads_connected
+
+  # -- held-out: metrics that have a recording rule (structured) ------------
+  rr_metric:
+    train:
+      - {name: http_requests_total,               rr: "job:http_requests:rate5m",            agg: job}
+      - {name: grpc_server_handled_total,         rr: "job:grpc_requests:rate5m",            agg: job}
+      - {name: container_cpu_usage_seconds_total, rr: "namespace:container_cpu_usage:rate5m", agg: namespace}
+      - {name: apiserver_request_total,           rr: "job:apiserver_requests:rate5m",       agg: job}
+    eval:
+      - {name: kafka_consumer_records_total,   rr: "job:kafka_consume:rate5m",        agg: job}
+      - {name: redis_commands_processed_total, rr: "job:redis_commands:rate5m",       agg: job}
+      - {name: nginx_http_requests_total,      rr: "namespace:nginx_requests:rate5m", agg: namespace}
+      - {name: postgres_queries_total,         rr: "job:postgres_queries:rate5m",     agg: job}
+
+  # -- held-out: histogram metrics (used with _bucket) ----------------------
+  hist_metric:
+    train:
+      - http_request_duration_seconds
+      - grpc_server_handling_seconds
+      - etcd_request_duration_seconds
+    eval:
+      - jvm_gc_pause_seconds
+      - s3_request_duration_seconds
+      - cassandra_read_latency_seconds
+
+  # -- held-out: jobs and namespaces ----------------------------------------
+  job:
+    train: [api-server, node-exporter, kube-state-metrics, cadvisor, alertmanager, envoy]
+    eval:  [payment-svc, checkout-api, ingest-worker, auth-gateway, search-indexer]
+  namespace:
+    train: [default, monitoring, kube-system, production, staging]
+    eval:  [payments, checkout, ingestion, identity, search]
+
+  # -- shared structural tokens ---------------------------------------------
+  window:
+    shared: ["1m", "2m", "5m", "10m", "15m", "30m"]
+  long_window:
+    shared: ["6h", "12h", "24h", "7d"]
+  sub_range:
+    shared: ["1h", "3h", "6h", "12h", "24h", "2d", "7d"]
+  quantile:
+    shared: ["0.50", "0.90", "0.95", "0.99"]
+  keep_label:
+    shared: [job, namespace, cluster]
+  bare_metric:
+    shared: [up, kube_pod_info, kube_node_info, kube_pod_owner, kube_deployment_status_replicas_available]
+  status_code:
+    shared: ["500", "502", "503", "4..", "5.."]
+  threshold:
+    shared: ["0.8", "0.9", "1.0", "100", "1000"]
+  topn:
+    shared: ["3", "5", "10"]
+  over_time:
+    shared: [avg_over_time, max_over_time, min_over_time, sum_over_time, stddev_over_time]
+  win_secs:
+    shared:
+      - {w: "1m",  secs: "60"}
+      - {w: "5m",  secs: "300"}
+      - {w: "10m", secs: "600"}
+      - {w: "15m", secs: "900"}
+      - {w: "30m", secs: "1800"}
+      - {w: "1h",  secs: "3600"}
+
+patterns:
+  # -- label_pushdown -------------------------------------------------------
+  - name: labelpush_rate
+    category: label_pushdown
+    instructions:
+      - 'add a job="{{ job }}" filter before the rate so fewer series are loaded from the TSDB'
+      - 'push the job="{{ job }}" filter into the rate selector so the TSDB filters at read time'
+      - 'restrict this to job="{{ job }}" by adding the filter inside the rate selector'
+    input:  'rate({{ metric }}[{{ window }}])'
+    output: 'rate({{ metric }}{job="{{ job }}"}[{{ window }}])'
+    train: 12
+    eval: 2
+
+  # contrastive partner to downsample_long: SAME input shape rate(m[long_window]),
+  # but a filter-only instruction -> label-add output (no downsample). Makes the
+  # long-window-rate shape ambiguous so the model must read the instruction.
+  - name: labelpush_longwindow
+    category: label_pushdown
+    instructions:
+      - 'add a job="{{ job }}" filter to this {{ long_window }} rate, leave the range as is'
+      - 'restrict this {{ long_window }} rate to job="{{ job }}" without changing the window'
+      - 'just add the job="{{ job }}" selector, keep the {{ long_window }} range unchanged'
+    input:  'rate({{ metric }}[{{ long_window }}])'
+    output: 'rate({{ metric }}{job="{{ job }}"}[{{ long_window }}])'
+    train: 12
+    eval: 2
+
+  - name: labelpush_sum_rate
+    category: label_pushdown
+    instructions:
+      - 'add job="{{ job }}" inside the rate selector so we do not scan all series first'
+      - 'push job="{{ job }}" into the rate selector inside this sum so the TSDB filters before aggregation'
+      - 'this sum should only cover job="{{ job }}", add the filter inside the rate selector'
+    input:  'sum(rate({{ metric }}[{{ window }}]))'
+    output: 'sum(rate({{ metric }}{job="{{ job }}"}[{{ window }}]))'
+    train: 12
+    eval: 2
+
+  - name: labelpush_postagg
+    category: label_pushdown
+    instructions:
+      - 'move the namespace="{{ namespace }}" filter inside the selector instead of applying it after aggregation'
+      - 'the namespace="{{ namespace }}" filter belongs in the rate selector, not after the sum'
+      - 'push namespace="{{ namespace }}" down into the selector so the sum starts with fewer series'
+    input:  'sum(rate({{ metric }}[{{ window }}])) {namespace="{{ namespace }}"}'
+    output: 'sum(rate({{ metric }}{namespace="{{ namespace }}"}[{{ window }}]))'
+    train: 12
+    eval: 2
+
+  - name: regex_to_equality
+    category: label_pushdown
+    instructions:
+      - 'job=~"{{ job }}" matches a single value, rewrite it as an equality matcher'
+      - 'this regex matcher has one value, convert job=~"{{ job }}" to job="{{ job }}"'
+      - 'simplify the single-value regex job=~"{{ job }}" to an equality match'
+    input:  '{{ metric }}{job=~"{{ job }}"}'
+    output: '{{ metric }}{job="{{ job }}"}'
+    train: 12
+    eval: 2
+
+  - name: multilabel_push
+    category: label_pushdown
+    instructions:
+      - 'add namespace="{{ namespace }}" and job="{{ job }}" selectors before the aggregation'
+      - 'push namespace="{{ namespace }}" and job="{{ job }}" into the metric selector, the by() clause is not a TSDB filter'
+      - 'the filters namespace="{{ namespace }}" and job="{{ job }}" belong in the metric selector, not the by() list'
+    input:  'sum by ({{ keep_label }}) ({{ metric }})'
+    output: 'sum by ({{ keep_label }}) ({{ metric }}{namespace="{{ namespace }}", job="{{ job }}"})'
+    train: 12
+    eval: 2
+
+  - name: join_push_both_sides
+    category: label_pushdown
+    instructions:
+      - 'move the namespace="{{ namespace }}" filter inside the selector on both sides of the join'
+      - 'add namespace="{{ namespace }}" to the selector on each side of the join, a trailing filter does not propagate'
+      - 'the namespace="{{ namespace }}" filter must appear on both metrics in the join, not as a trailing selector'
+    input:  '{{ metric }} * on(pod) kube_pod_info {namespace="{{ namespace }}"}'
+    output: '{{ metric }}{namespace="{{ namespace }}"} * on(pod) kube_pod_info{namespace="{{ namespace }}"}'
+    train: 12
+    eval: 2
+
+  # -- cardinality_reduction -------------------------------------------------
+  - name: drop_labels
+    category: cardinality_reduction
+    instructions:
+      - 'drop instance and pod from the sum, only job is needed for this alert'
+      - 'remove instance and pod from the grouping, keep only job'
+      - 'this alert only needs job, drop instance and pod from the sum'
+    input:  'sum by (job, instance, pod) (rate({{ metric }}[{{ window }}]))'
+    output: 'sum by (job) (rate({{ metric }}[{{ window }}]))'
+    train: 12
+    eval: 2
+
+  - name: by_to_without
+    category: cardinality_reduction
+    instructions:
+      - 'switch from by to without(instance) since there are many labels to keep and only one to drop'
+      - 'there are too many labels to list in by(), use without(instance) instead'
+      - 'rewrite this as without(instance), keeping every label except instance is simpler'
+    input:  'sum by (job, namespace, cluster, region, env) (rate({{ metric }}[{{ window }}]))'
+    output: 'sum without (instance) (rate({{ metric }}[{{ window }}]))'
+    train: 10
+    eval: 2
+
+  - name: hist_keep_le
+    category: cardinality_reduction
+    instructions:
+      - 'histogram_quantile only needs le in the sum, drop pod and node'
+      - 'keep only le in the sum before the quantile, pod and node add unnecessary cardinality'
+      - 'strip pod and node from the sum inside histogram_quantile, only le is needed'
+    input:  'histogram_quantile({{ quantile }}, sum by (le, pod, node) (rate({{ hist_metric }}_bucket[{{ window }}])))'
+    output: 'histogram_quantile({{ quantile }}, sum by (le) (rate({{ hist_metric }}_bucket[{{ window }}])))'
+    train: 12
+    eval: 2
+
+  - name: prejoin_aggregate
+    category: cardinality_reduction
+    instructions:
+      - 'aggregate both sides by job before the join to cut series count, and update on() to just job'
+      - 'sum both sides by job before the join so fewer series match, change on(job, instance) to on(job)'
+      - 'drop instance before the join by summing both sides by job, and narrow on() to job'
+    input:  'rate({{ metric }}[5m]) * on(job, instance) group_left() {{ bare_metric }}'
+    output: 'sum by (job) (rate({{ metric }}[5m])) * on(job) group_left() sum by (job) ({{ bare_metric }})'
+    train: 12
+    eval: 2
+
+  # -- recording_rule ---------------------------------------------------------
+  - name: rr_sum
+    category: recording_rule
+    instructions:
+      - 'replace the inline rate with the recording rule {{ rr_metric.rr }}'
+      - 'use the recording rule {{ rr_metric.rr }} instead of computing this rate inline'
+      - 'this aggregated rate has a recording rule, use {{ rr_metric.rr }}'
+    input:  'sum by ({{ rr_metric.agg }}) (rate({{ rr_metric.name }}[5m]))'
+    output: 'sum by ({{ rr_metric.agg }}) ({{ rr_metric.rr }})'
+    train: 12
+    eval: 2
+
+  - name: rr_job_filter
+    category: recording_rule
+    instructions:
+      - 'use the recording rule instead of the raw rate for {{ job }}'
+      - 'replace this inline rate for {{ job }} with the recording rule {{ rr_metric.rr }}, keep the job filter'
+      - 'the rate for {{ job }} has a recording rule, use {{ rr_metric.rr }} and keep job="{{ job }}"'
+    input:  'rate({{ rr_metric.name }}{job="{{ job }}"}[5m])'
+    output: '{{ rr_metric.rr }}{job="{{ job }}"}'
+    train: 12
+    eval: 2
+
+  - name: rr_alert
+    category: recording_rule
+    instructions:
+      - 'swap the raw rate for {{ rr_metric.rr }} in this alert to reduce evaluator load'
+      - 'this alert recomputes a rate that has a recording rule, use {{ rr_metric.rr }}'
+      - 'replace the inline rate with {{ rr_metric.rr }} so the alert is cheaper to evaluate'
+    input:  'sum(rate({{ rr_metric.name }}{job="{{ job }}"}[5m])) > {{ threshold }}'
+    output: 'sum({{ rr_metric.rr }}{job="{{ job }}"}) > {{ threshold }}'
+    train: 10
+    eval: 2
+
+  - name: rr_ratio
+    category: recording_rule
+    instructions:
+      - 'replace both sides of this error ratio with the recording rule {{ rr_metric.rr }}'
+      - 'both rates in this ratio have a recording rule, use {{ rr_metric.rr }} on each side'
+      - 'use {{ rr_metric.rr }} for both the numerator and denominator of this ratio'
+    input:  'sum(rate({{ rr_metric.name }}{status_code="{{ status_code }}"}[5m])) / sum(rate({{ rr_metric.name }}[5m]))'
+    output: 'sum({{ rr_metric.rr }}{status_code="{{ status_code }}"}) / sum({{ rr_metric.rr }})'
+    train: 10
+    eval: 2
+
+  # -- window_resolution -------------------------------------------------------
+  - name: downsample_long
+    category: window_resolution
+    instructions:
+      - 'this is a {{ long_window }} range, add a 5m subquery step to avoid scanning raw blocks'
+      - 'add a :5m step to this {{ long_window }} rate so only downsampled blocks are read'
+      - 'this {{ long_window }} query should read downsampled data, append a 5m step'
+    input:  'rate({{ metric }}[{{ long_window }}])'
+    output: 'rate({{ metric }}[{{ long_window }}:5m])'
+    train: 12
+    eval: 2
+
+  - name: irate_to_rate
+    category: window_resolution
+    instructions:
+      - 'this is an alert rule, switch irate to rate because irate flaps on single scrape gaps'
+      - 'irate is too sensitive for an alert, replace it with rate over 5m'
+      - 'use rate instead of irate here so a single scrape gap does not cause flapping'
+    input:  'irate({{ metric }}[{{ window }}])'
+    output: 'rate({{ metric }}[5m])'
+    train: 10
+    eval: 2
+
+  - name: rate_to_irate
+    category: window_resolution
+    instructions:
+      - 'this is a real-time dashboard panel, switch rate to irate for faster response to changes'
+      - 'use irate for this live panel so it reacts quickly to changes'
+      - 'a dashboard panel wants responsiveness, replace rate with irate over 2m'
+    input:  'rate({{ metric }}[5m])'
+    output: 'irate({{ metric }}[2m])'
+    train: 10
+    eval: 2
+
+  - name: widen_window
+    category: window_resolution
+    instructions:
+      - 'widen the rate window from 1m to 5m so scrape gaps do not produce NaN'
+      - 'a 1m rate window is too narrow, widen it to 5m'
+      - 'increase the rate window to 5m so a missed scrape does not yield NaN'
+    input:  'rate({{ metric }}[1m])'
+    output: 'rate({{ metric }}[5m])'
+    train: 10
+    eval: 2
+
+  - name: subq_step_overtime
+    category: window_resolution
+    instructions:
+      - 'change the subquery step from 1m to 1h for this {{ sub_range }} average, minute resolution is not needed'
+      - 'the {{ sub_range }} average does not need 1m resolution, change the step to 1h'
+      - 'lower the subquery step from 1m to 1h over this {{ sub_range }} window'
+    input:  'avg_over_time({{ metric }}[{{ sub_range }}:1m])'
+    output: 'avg_over_time({{ metric }}[{{ sub_range }}:1h])'
+    train: 10
+    eval: 2
+
+  - name: predict_step_window
+    category: window_resolution
+    instructions:
+      - 'change the predict_linear subquery step from 1m to 5m, the {{ sub_range }} range stays the same'
+      - 'lower the predict_linear step from 1m to 5m without touching the {{ sub_range }} range'
+      - 'predict_linear is evaluating at 1m steps over {{ sub_range }}, change only the step to 5m'
+    input:  'predict_linear(rate({{ metric }}[5m])[{{ sub_range }}:1m], 3600)'
+    output: 'predict_linear(rate({{ metric }}[5m])[{{ sub_range }}:5m], 3600)'
+    train: 10
+    eval: 2
+
+  # -- function_swap ---------------------------------------------------------
+  - name: rate_to_increase
+    category: function_swap
+    instructions:
+      - 'replace rate() * {{ win_secs.secs }} with increase() since they are equivalent and increase() is clearer'
+      - 'rate times {{ win_secs.secs }} over a {{ win_secs.w }} window is just increase(), rewrite it'
+      - 'this is increase() written the long way, simplify rate() * {{ win_secs.secs }}'
+    input:  'rate({{ metric }}[{{ win_secs.w }}]) * {{ win_secs.secs }}'
+    output: 'increase({{ metric }}[{{ win_secs.w }}])'
+    train: 12
+    eval: 2
+
+  - name: topk1_to_max
+    category: function_swap
+    instructions:
+      - 'topk(1) just returns the max, rewrite it as max() to avoid unnecessary sorting'
+      - 'use max() instead of topk(1), it avoids the sort'
+      - 'topk(1) is the maximum, replace it with max()'
+    input:  'topk(1, {{ metric }})'
+    output: 'max({{ metric }})'
+    train: 10
+    eval: 2
+
+  - name: remove_sort
+    category: function_swap
+    instructions:
+      - 'remove sort() from this expression, sort has no effect in a recording rule'
+      - 'sort() does nothing in a rule evaluation, drop it'
+      - 'strip the sort() wrapper, ordering is meaningless here'
+    input:  'sort(sum by (job) (rate({{ metric }}[{{ window }}])))'
+    output: 'sum by (job) (rate({{ metric }}[{{ window }}]))'
+    train: 10
+    eval: 2
+
+  - name: min_subq_to_minovertime
+    category: function_swap
+    instructions:
+      - 'rewrite this as min_over_time() instead of wrapping min() around the subquery'
+      - 'use min_over_time() here, wrapping min() around a subquery is the wrong tool'
+      - 'this should be min_over_time(), not min() over a subquery'
+    input:  'min(rate({{ metric }}[5m])[1h:5m])'
+    output: 'min_over_time(rate({{ metric }}[5m])[1h:5m])'
+    train: 8
+    eval: 2
+
+  - name: sortdesc_topk
+    category: function_swap
+    instructions:
+      - 'sort_desc(topk({{ topn }})) is redundant because topk already returns descending order'
+      - 'topk already sorts descending, drop the sort_desc wrapper'
+      - 'remove sort_desc around topk({{ topn }}), it is already ordered'
+    input:  'sort_desc(topk({{ topn }}, {{ metric }}))'
+    output: 'topk({{ topn }}, {{ metric }})'
+    train: 10
+    eval: 2
+
+  # -- subquery_elimination -------------------------------------------------
+  - name: subq_step_generic
+    category: subquery_elimination
+    instructions:
+      - 'change the {{ over_time }} subquery step from 1m to 5m to reduce how many times the inner expression runs'
+      - 'lower the {{ over_time }} step from 1m to 5m over this {{ sub_range }} window'
+      - 'the {{ over_time }} subquery runs too often, change the step from 1m to 5m'
+    input:  '{{ over_time }}(rate({{ metric }}[5m])[{{ sub_range }}:1m])'
+    output: '{{ over_time }}(rate({{ metric }}[5m])[{{ sub_range }}:5m])'
+    train: 12
+    eval: 2
+
+  - name: subq_inner_rr
+    category: subquery_elimination
+    instructions:
+      - 'replace the inner rate in {{ over_time }} with the recording rule {{ rr_metric.rr }} to avoid recomputing it'
+      - 'the inner rate has a recording rule, use {{ rr_metric.rr }} inside {{ over_time }}'
+      - 'avoid recomputing the rate at every step, use {{ rr_metric.rr }} inside {{ over_time }}'
+    input:  '{{ over_time }}(rate({{ rr_metric.name }}[5m])[{{ sub_range }}:5m])'
+    output: '{{ over_time }}({{ rr_metric.rr }}[{{ sub_range }}:5m])'
+    train: 12
+    eval: 2
+
+  - name: predict_step_subq
+    category: subquery_elimination
+    instructions:
+      - 'change the predict_linear subquery step from 1m to 5m to cut compute'
+      - 'the predict_linear step is 1m over {{ sub_range }}, lower it to 5m'
+      - 'reduce predict_linear evaluations by changing the step from 1m to 5m'
+    input:  'predict_linear(rate({{ metric }}[5m])[{{ sub_range }}:1m], 3600)'
+    output: 'predict_linear(rate({{ metric }}[5m])[{{ sub_range }}:5m], 3600)'
+    train: 10
+    eval: 2
+
+  # -- thanos -----------------------------------------------------------------
+  - name: thanos_replica_sum
+    category: thanos
+    instructions:
+      - 'remove replica from the aggregation labels to deduplicate data across Thanos replicas'
+      - 'the replica label causes double counting in Thanos, drop it from the sum'
+      - 'deduplicate across Thanos replicas by removing replica from the by() clause'
+    input:  'sum by (job, namespace, replica) (rate({{ metric }}[{{ window }}]))'
+    output: 'sum by (job, namespace) (rate({{ metric }}[{{ window }}]))'
+    train: 10
+    eval: 2
+
+  - name: thanos_replica_count
+    category: thanos
+    instructions:
+      - 'drop replica from the count by ({{ keep_label }}, replica) to avoid double counting across Thanos replicas'
+      - 'remove replica from this count so Thanos deduplicates before counting'
+      - 'replica inflates the count when Thanos has multiple replicas, drop it'
+    input:  'count by ({{ keep_label }}, replica) ({{ bare_metric }})'
+    output: 'count by ({{ keep_label }}) ({{ bare_metric }})'
+    train: 10
+    eval: 2
+
+  - name: thanos_join_namespace
+    category: thanos
+    instructions:
+      - 'add namespace="{{ namespace }}" to both sides of the join to avoid pulling series from remote Thanos stores'
+      - 'restrict both sides of this join to namespace="{{ namespace }}" so Thanos does not fan out across stores'
+      - 'this join scans all stores, add namespace="{{ namespace }}" to both metrics'
+    input:  '{{ metric }} * on(namespace, pod) group_left(owner) kube_pod_owner'
+    output: '{{ metric }}{namespace="{{ namespace }}"} * on(namespace, pod) group_left(owner) kube_pod_owner{namespace="{{ namespace }}"}'
+    train: 10
+    eval: 2
+
+  - name: thanos_subq_1h
+    category: thanos
+    instructions:
+      - 'this is a 7 day range in Thanos, change the subquery step to 1h to avoid scanning raw blocks'
+      - 'over 7 days Thanos should not read raw blocks, change the step to 1h'
+      - 'raise the subquery step to 1h for this 7d Thanos query'
+    input:  'sum_over_time(rate({{ metric }}[5m])[7d:1m])'
+    output: 'sum_over_time(rate({{ metric }}[5m])[7d:1h])'
+    train: 8
+    eval: 2
+
+  # -- structural -------------------------------------------------------------
+  - name: redundant_outer_sum
+    category: structural
+    instructions:
+      - 'the outer sum is redundant since sum by (job) already produces one series per job, remove it'
+      - 'sum by (job) already collapses to one series per job, drop the outer sum'
+      - 'this double sum is redundant, the inner sum by (job) is enough'
+    input:  'sum(sum by (job) (rate({{ metric }}[{{ window }}])))'
+    output: 'sum by (job) (rate({{ metric }}[{{ window }}]))'
+    train: 10
+    eval: 2
+
+  - name: filter_before_join
+    category: structural
+    instructions:
+      - 'move the threshold filter before the join to reduce the number of series fed into it'
+      - 'apply the > {{ threshold }} filter before the join so the join sees fewer series'
+      - 'push the threshold comparison ahead of the join'
+    input:  '({{ metric }} * on(pod) kube_pod_info) > {{ threshold }}'
+    output: '({{ metric }} > {{ threshold }}) * on(pod) kube_pod_info'
+    train: 10
+    eval: 2
+
+  - name: merge_regex
+    category: structural
+    instructions:
+      - 'merge the two rate calls on the same metric into a single expression using a regex on job'
+      - 'combine these two rates into one using job=~"a|b"'
+      - 'fold the two job-specific rates into a single regex-matched rate'
+    input:  'rate({{ metric }}{job="a"}[{{ window }}]) + rate({{ metric }}{job="b"}[{{ window }}])'
+    output: 'sum(rate({{ metric }}{job=~"a|b"}[{{ window }}]))'
+    train: 10
+    eval: 2
+
+  - name: double_sum_hist
+    category: structural
+    instructions:
+      - 'remove the outer sum() wrapping sum by (le) inside histogram_quantile, it collapses le incorrectly'
+      - 'the double sum inside histogram_quantile is wrong, keep only sum by (le)'
+      - 'strip the redundant outer sum() inside histogram_quantile'
+    input:  'histogram_quantile({{ quantile }}, sum(sum by (le) (rate({{ hist_metric }}_bucket[{{ window }}]))))'
+    output: 'histogram_quantile({{ quantile }}, sum by (le) (rate({{ hist_metric }}_bucket[{{ window }}])))'
+    train: 10
+    eval: 2
+
+  - name: algebraic_identity
+    category: structural
+    instructions:
+      - 'x minus x times 0 equals x, simplify this expression'
+      - 'this subtracts zero, simplify it to just the metric'
+      - 'the x*0 term is always zero, reduce this to the metric'
+    input:  '{{ metric }} - ({{ metric }} * 0)'
+    output: '{{ metric }}'
+    train: 8
+    eval: 2
+
+  # -- compositions: each chains TWO transforms -------------------------------
+  # `train: N` => composition TYPE is trained (eval on held-out vocab tests vocab
+  # transfer). No train => TYPE never seen (eval tests true compositional generalization).
+
+  # --- TRAINED composition types (model learns to chain these) ---
+  - name: comp_labelpush_rr
+    category: composition
+    composite: true
+    instructions:
+      - 'filter this to job="{{ job }}" and switch to the recording rule {{ rr_metric.rr }}'
+      - 'restrict to job="{{ job }}" and replace the inline rate with {{ rr_metric.rr }}'
+    input:  'rate({{ rr_metric.name }}[5m])'
+    output: '{{ rr_metric.rr }}{job="{{ job }}"}'
+    train: 10
+    eval: 4
+
+  - name: comp_cardinality_rr
+    category: composition
+    composite: true
+    instructions:
+      - 'drop instance and pod, and replace the inline rate with the recording rule {{ rr_metric.rr }}'
+      - 'keep only {{ rr_metric.agg }}, and use {{ rr_metric.rr }} instead of computing the rate'
+    input:  'sum by ({{ rr_metric.agg }}, instance, pod) (rate({{ rr_metric.name }}[5m]))'
+    output: 'sum by ({{ rr_metric.agg }}) ({{ rr_metric.rr }})'
+    train: 10
+    eval: 4
+
+  - name: comp_thanos_replica_downsample
+    category: composition
+    composite: true
+    instructions:
+      - 'drop replica from the aggregation and add a 5m downsample step for this {{ long_window }} range'
+      - 'deduplicate across Thanos replicas by removing replica, and downsample this {{ long_window }} range to 5m'
+    input:  'sum by (job, namespace, replica) (rate({{ metric }}[{{ long_window }}]))'
+    output: 'sum by (job, namespace) (rate({{ metric }}[{{ long_window }}:5m]))'
+    train: 10
+    eval: 4
+
+  # --- coverage-scaling probe: 5 trained types, comp_window_labelpush held out ---
+  - name: comp_hist_cardinality_downsample
+    category: composition
+    composite: true
+    instructions:
+      - 'keep only le in the histogram sum and add a 5m downsample step for this {{ long_window }} range'
+      - 'strip pod from the histogram sum and downsample this {{ long_window }} range to 5m'
+    input:  'histogram_quantile({{ quantile }}, sum by (le, pod) (rate({{ hist_metric }}_bucket[{{ long_window }}])))'
+    output: 'histogram_quantile({{ quantile }}, sum by (le) (rate({{ hist_metric }}_bucket[{{ long_window }}:5m])))'
+    train: 10
+    eval: 6
+
+  - name: comp_subq_rr
+    category: composition
+    composite: true
+    instructions:
+      - 'change the subquery step from 1m to 5m and replace the inner rate with the recording rule {{ rr_metric.rr }}'
+      - 'use {{ rr_metric.rr }} inside {{ over_time }} and lower the step from 1m to 5m'
+    input:  '{{ over_time }}(rate({{ rr_metric.name }}[5m])[{{ sub_range }}:1m])'
+    output: '{{ over_time }}({{ rr_metric.rr }}[{{ sub_range }}:5m])'
+    train: 10
+    eval: 6
+
+  # --- HELD-OUT probe: chains two INSERTION transforms (downsample step + add label).
+  #     Both individually ~100%; 0% composed. Does training 5 other comps unlock it? ---
+  - name: comp_window_labelpush
+    category: composition
+    composite: true
+    instructions:
+      - 'add a 5m downsample step for this {{ long_window }} range and filter to job="{{ job }}"'
+      - 'restrict to job="{{ job }}" and add a 5m subquery step to this {{ long_window }} rate'
+    input:  'rate({{ metric }}[{{ long_window }}])'
+    output: 'rate({{ metric }}{job="{{ job }}"}[{{ long_window }}:5m])'
+    eval: 12

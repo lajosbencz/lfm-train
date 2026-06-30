@@ -1,0 +1,48 @@
+# PromQL query optimization -- SFT experiment (Qwen3-0.6B-Base, Apache-2.0 baseline)
+# Sits in the same param range as the LFM2.5 230M/350M/1.2B sweep, no LiquidAI
+# revenue-tier license restriction (Apache 2.0).
+
+model:
+  name: "Qwen/Qwen3-0.6B-Base"
+  max_seq_length: 512
+  load_in_4bit: true
+  dtype: "bfloat16"
+
+lora:
+  r: 48
+  alpha: 48
+  dropout: 0.0
+  bias: "none"
+  # Qwen3 dense attention + standard SwiGLU MLP naming
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  # Tied embeddings; <|im_end|> is reserved-but-unexercised in pretraining.
+  # Full fine-tune the head so the model can actually learn to stop there.
+  modules_to_save:
+    - lm_head
+    - embed_tokens
+
+training:
+  method: "sft"
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 2
+  warmup_steps: 20
+  max_steps: -1
+  num_train_epochs: 6
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  lr_scheduler_type: "cosine"
+  optim: "adamw_8bit"
+  bf16: true
+  fp16: false
+  gradient_checkpointing: "unsloth"
+  logging_steps: 5
+  save_steps: 30
+  eval_steps: 30
+  output_dir: "outputs/qwen3-0.6b"

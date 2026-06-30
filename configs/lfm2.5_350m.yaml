@@ -1,0 +1,41 @@
+# PromQL query optimization -- SFT experiment (350M model)
+
+model:
+  name: "LiquidAI/LFM2.5-350M-Base"
+  max_seq_length: 512
+  load_in_4bit: true
+  dtype: "bfloat16"
+
+lora:
+  r: 48
+  alpha: 48
+  dropout: 0.0
+  bias: "none"
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - out_proj
+    - in_proj
+    - w1
+    - w2
+    - w3
+
+training:
+  method: "sft"
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 2
+  warmup_steps: 20
+  max_steps: -1
+  num_train_epochs: 6
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  lr_scheduler_type: "cosine"
+  optim: "adamw_8bit"
+  bf16: true
+  fp16: false
+  gradient_checkpointing: "unsloth"
+  logging_steps: 5
+  save_steps: 30
+  eval_steps: 30
+  output_dir: "outputs/lfm2.5-350m"
