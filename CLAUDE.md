@@ -60,6 +60,31 @@ Full evidence: @docs/compositional-generalization.md
 
 Or the Makefile: `make dataset|train|benchmark|eval|infer|publish`.
 
+## Prompting format (read before touching inference)
+
+The chat format is ChatML, applied identically at train and inference time:
+- system = the domain `system_prompt`; user = `dataset.build_user()` (the
+  instruction, optionally followed by `\n\n{input_label}:\n{input}`); assistant
+  = the target.
+- Rendered via `tokenizer.apply_chat_template(..., enable_thinking=False)` in
+  BOTH `dataset._format` (train) and `evaluate._infer` (inference). The exact
+  framing (system_prompt + input_label) is saved next to each adapter as
+  `prompt_config.json`, so serving reproduces training.
+- `enable_thinking=False` is a no-op for plain templates (LFM2.5) but for Qwen3
+  it STILL injects an empty `<think>\n\n</think>\n\n` block into the assistant
+  turn. The model is trained with that block, so inference must reproduce it.
+
+Serving the GGUF: ALWAYS go through the model's embedded chat template -
+`llama-server` (default), `llama-cli/llama-completion --jinja`, or Ollama. These
+tokenize the special tokens (`<|im_start|>`, `<think>`) correctly. Do NOT
+hand-build a raw ChatML string and feed it via `llama-completion -f`: that path
+does not parse `<think>` as a special token, so Qwen3 (whose assistant turn
+contains `<think></think>`) gets malformed input and rambles (it echoes an
+instruction + "Query:" instead of answering). LFM2.5 has no think block, so a
+raw prompt happens to work for it - which masks the bug. (A probe using raw `-f`
+prompts once made the Qwen3 GGUF look broken when it was fine; verify GGUFs via
+`--jinja` only.)
+
 ## Working notes
 
 - Run benchmarks/training in the background and poll the log; don't pull whole
