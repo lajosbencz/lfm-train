@@ -88,6 +88,12 @@ uv run evaluate --finetuned outputs/lfm2.5-350m/lora_adapter --data data/promql
 uv run infer outputs/lfm2.5-350m/lora_adapter
 ```
 
+To prompt a published model directly, see:
+- [examples/prompt_transformers.py](examples/prompt_transformers.py) (fp16)
+- [examples/prompt_gguf.py](examples/prompt_gguf.py) (Q4_K_M GGUF).
+
+Both go through the chat template - the one rule for prompting these models correctly.
+
 Each training run writes to `outputs/<model>/`: a LoRA adapter (`lora_adapter/`), a merged fp16 model (`merged_16bit/`), a Q4_K_M GGUF (`gguf_gguf/`), training metrics, and plots.
 
 ## Adding a domain
@@ -132,6 +138,7 @@ uv run publish outputs/qwen3-0.6b/merged_16bit  <user>/qwen3-0.6b-promql \
 ```
 configs/                 model + training configs (domain-agnostic)
 domains/                 domain specs (vocab + patterns + prompt) - edit to add a domain
+examples/                how to prompt a published model (transformers + GGUF)
 src/lfm_train/
   data/engine.py         domain-agnostic dataset generator
   data/generate.py       gen-dataset CLI
