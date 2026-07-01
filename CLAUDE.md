@@ -1,9 +1,39 @@
 # lfm-train
 
 Benchmarking harness for fine-tuning small (<=1.2B) base language models on a
-domain-specific instruction -> rewrite task, with QLoRA SFT (Unsloth + TRL +
-PEFT). Reference domain: PromQL query optimization. Single RTX 3060 Ti (8GB),
-`uv` for env.
+domain-specific instruction -> rewrite task, with QLoRA SFT. Reference domain:
+PromQL query optimization. `uv` for env.
+
+## Backends (NVIDIA vs Apple Silicon)
+
+Every model-touching operation goes through a `Backend` (`src/lfm_train/backends/`):
+- `cuda` - Unsloth + TRL + PEFT + bitsandbytes on NVIDIA/Linux (RTX 3060 Ti 8GB
+  reference). Full feature set: train, eval, benchmark, infer, GGUF publish.
+- `mlx` - `mlx_lm` on Apple Silicon/Metal. Implements **train + inference** only;
+  `benchmark` and `publish` raise `NotImplementedError` (the subprocess/CUDA-
+  telemetry orchestrator and GGUF export don't port). *Untested on Metal* - no
+  Apple hardware; delivered with structural checks on Linux.
+
+Selection (`backends.get_backend`): explicit `--backend {auto,cuda,mlx}` flag ->
+`LFM_TRAIN_BACKEND` env -> platform default (`mlx` on macOS, else `cuda`). The
+install-time uv extra and this runtime default both key off platform, so they
+align by default.
+
+Install-time branching is via uv markers + conflicting extras (one `uv.lock`):
+`uv sync --extra cuda` (Linux) / `uv sync --extra mlx` (macOS-arm64). `mlx-lm` is
+marker-gated to darwin-arm64 and `torch/unsloth/bitsandbytes` to linux, so neither
+host resolves the other's stack. `transformers>=5` is shared by both backends.
+
+MLX specifics: QLoRA = point training at a 4-bit-converted base (`mlx_lm.convert
+-q`); no GGUF (mlx-lm only exports GGUF for Llama/Mistral/Mixtral); serve the MLX
+dir via `mlx_lm.server` or LM Studio. The dataset/prompt layer is shared verbatim
+- `dataset._format` already renders `text` with `enable_thinking=False`, which is
+the MLX-safe representation, so both backends train on identical strings.
+
+The seam is the only place backends differ: `backends/base.py` (interface),
+`cuda.py`, `mlx.py`, and the pure `config_map.py` (project config -> mlx LoRA
+knobs, unit-testable with no mlx installed). The dataset engine, prompt rendering,
+config merge, plotting, eval scoring, and `publish` (GGUF) are backend-agnostic.
 
 ## Separation of concerns (important)
 

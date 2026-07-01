@@ -2,26 +2,34 @@
 name = "lfm-train"
 version = "0.1.0"
 requires-python = ">=3.11"
+# Cross-platform core. Backend-specific stacks live in the `cuda` / `mlx` extras.
+# transformers 5.x is shared by both backends (mlx-lm requires >=5; the Unsloth
+# path tracks transformers HEAD and works on 5.x too). bitsandbytes is a
+# CUDA-only wheel, so it is marker-gated to linux.
 dependencies = [
     "trl>=0.17.0",
     "peft>=0.14.0",
-    "transformers>=4.52.0",
+    "transformers>=5.0.0",
     "datasets>=3.6.0",
     "accelerate>=1.8.0",
-    "bitsandbytes>=0.45.5",
     "sentencepiece>=0.2.0",
     "pyyaml>=6.0",
     "jinja2>=3.1.0",
     "matplotlib>=3.9.0",
     "huggingface-hub>=0.26.0",
+    "bitsandbytes>=0.45.5; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
-# Install with: uv sync --extra gpu
-gpu = [
-    "torch>=2.6.0",
-    "unsloth",
-    "unsloth-zoo",
+# NVIDIA / Linux backend.  Install with: uv sync --extra cuda
+cuda = [
+    "torch>=2.6.0; sys_platform == 'linux'",
+    "unsloth; sys_platform == 'linux'",
+    "unsloth-zoo; sys_platform == 'linux'",
+]
+# Apple Silicon / Metal backend.  Install with: uv sync --extra mlx
+mlx = [
+    "mlx-lm>=0.21; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
 [project.scripts]
@@ -39,9 +47,17 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/lfm_train"]
 
+[tool.uv]
+# cuda (Unsloth/torch) and mlx (Metal) are mutually exclusive: never co-resolve
+# them into one environment.
+conflicts = [[{ extra = "cuda" }, { extra = "mlx" }]]
+# Keep the universal lock to the two platforms we actually target.
+environments = ["sys_platform == 'darwin'", "sys_platform == 'linux'"]
+
 [tool.uv.sources]
-# Pulls the latest unsloth from git; pin to a commit SHA for reproducibility
-unsloth = { git = "https://github.com/unslothai/unsloth.git" }
+# Pulls the latest unsloth from git; pin to a commit SHA for reproducibility.
+# Marker-scoped so uv never fetches the git repo on macOS.
+unsloth = { git = "https://github.com/unslothai/unsloth.git", marker = "sys_platform == 'linux'" }
 
 [tool.uv.extra-build-dependencies]
 unsloth = ["setuptools"]

@@ -37,6 +37,19 @@ Mechanism and experiments:
 
 ![benchmark chart](docs/assets/benchmark_chart.png)
 
+## Hardware
+
+Two interchangeable compute backends, selected at install time and at runtime:
+
+| Backend | Hardware | Stack | Capabilities |
+|---|---|---|---|
+| `cuda` | NVIDIA GPU (dev: RTX 3060 Ti, 8GB) | Unsloth + TRL + PEFT + bitsandbytes | train, evaluate, benchmark, infer, GGUF publish |
+| `mlx`  | Apple Silicon (Metal) | `mlx-lm` | train + infer (evaluate works; benchmark/publish are CUDA-only) |
+
+- **Install** the stack for your hardware: `uv sync --extra cuda` (NVIDIA/Linux) or `uv sync --extra mlx` (Apple Silicon). One `uv.lock` covers both; platform markers keep each host from resolving the other's stack.
+- **Select** a backend per run via `--backend {auto,cuda,mlx}`, the `LFM_TRAIN_BACKEND` env var, or the platform default (`mlx` on macOS, else `cuda`). The CLI, configs, dataset, and prompt format are identical across backends.
+- The `mlx` backend is **untested on Metal** (developed without Apple hardware); it ships with structural checks only. QLoRA on MLX trains against a 4-bit base and serves the MLX model dir (`mlx_lm.server` / LM Studio) - there is no GGUF.
+
 ## How it works
 
 Three clean layers:
@@ -61,11 +74,20 @@ The headline result is the gap between the last two: `composed_trained` lands at
 
 ## Quickstart
 
-Requirements: an NVIDIA GPU (developed on an RTX 3060 Ti, 8GB), Python 3.12, and [`uv`](https://docs.astral.sh/uv/). Everything below runs locally; no LLM agent needed.
+Requirements: 
+- Python 3.12
+- [`uv`](https://docs.astral.sh/uv/)
+- and one of two backends
+  - NVIDIA GPU (developed on an RTX 3060 Ti, 8GB) for the `cuda` stack
+  - Apple Silicon for the `mlx` stack
+
+The `mlx` backend supports train + inference only (no benchmark/publish), and is untested on Metal.
+Select a backend with `--backend`, `LFM_TRAIN_BACKEND`, or leave it auto.
 
 ```sh
-# 1. install (CUDA training stack)
-uv sync --extra gpu          # or: make install
+# 1. install the backend for your hardware
+uv sync --extra cuda         # NVIDIA/Linux  (or: make install)
+# uv sync --extra mlx        # Apple Silicon (or: make install-mlx)
 
 # 2. generate the dataset from the domain spec
 uv run gen-dataset           # or: make dataset

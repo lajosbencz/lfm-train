@@ -30,15 +30,24 @@ def _abbrev(name: str, width: int = 11) -> str:
 
 # -- worker (isolated subprocess per model) ------------------------------------
 
-def _worker(config_path: str, data_prefix: str, result_file: str, skip_train: bool = False) -> None:
+def _worker(config_path: str, data_prefix: str, result_file: str,
+            skip_train: bool = False, backend_name: str = "auto") -> None:
     """Train (unless skip_train) one config, evaluate, write JSON result to result_file."""
-    import torch
     from collections import defaultdict
 
+    from lfm_train.backends import get_backend, resolve_name
     from lfm_train.trainer import _load_config, train_sft
     from lfm_train.evaluate import _infer, _normalize
-    from lfm_train.dataset import align_eos_token, ensure_chat_template, resolve_data
-    from unsloth import FastLanguageModel
+    from lfm_train.dataset import resolve_data
+
+    # The benchmark harness (subprocess isolation, GPU-memory telemetry, torch
+    # param introspection) is CUDA-only by design; the MLX backend implements
+    # train + inference but not this orchestrator.
+    if resolve_name(backend_name) != "cuda":
+        raise NotImplementedError(
+            "benchmark is CUDA-only; the mlx backend supports train + infer "
+            "(use `train` / `infer` / `evaluate` with --backend mlx)")
+    backend = get_backend(backend_name)
 
     cfg = _load_config(config_path)
     output_dir = Path(cfg["training"]["output_dir"])
@@ -51,30 +60,21 @@ def _worker(config_path: str, data_prefix: str, result_file: str, skip_train: bo
         # trained checkpoint has no train timing to recover here.
         pass
     else:
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-        train_metrics = train_sft(cfg, str(train_path), prompt)
+        backend.reset_peak_memory()
+        train_metrics = train_sft(cfg, str(train_path), prompt, backend=backend_name)
         timing["train_runtime_sec"]        = train_metrics.get("train_runtime")
         timing["train_samples_per_second"] = train_metrics.get("train_samples_per_second")
         timing["train_steps_per_second"]   = train_metrics.get("train_steps_per_second")
-        if torch.cuda.is_available():
-            timing["train_gpu_mem_peak_mb"] = torch.cuda.max_memory_allocated() / 1e6
+        peak = backend.peak_memory_mb()
+        if peak is not None:
+            timing["train_gpu_mem_peak_mb"] = peak
 
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
+    backend.reset_peak_memory()
 
     adapter_path = str(output_dir / "lora_adapter")
     print(f"\nLoading adapter for eval: {adapter_path}", flush=True)
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=adapter_path,
-        max_seq_length=cfg["model"]["max_seq_length"],
-        load_in_4bit=cfg["model"].get("load_in_4bit", True),
-        dtype=None,
-        use_exact_model_name=True,
-    )
-    ensure_chat_template(tokenizer)
-    align_eos_token(model, tokenizer)
-    FastLanguageModel.for_inference(model)
+    model, tokenizer = backend.load_inference(
+        adapter_path, max_seq_length=cfg["model"]["max_seq_length"])
 
     total_params     = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -93,7 +93,7 @@ def _worker(config_path: str, data_prefix: str, result_file: str, skip_train: bo
     eval_tokens = 0
     eval_start = time.perf_counter()
     for ex in examples:
-        pred  = _infer(model, tokenizer, ex["instruction"], ex.get("input", ""),
+        pred  = _infer(backend, model, tokenizer, ex["instruction"], ex.get("input", ""),
                        system_prompt, input_label)
         eval_tokens += len(tokenizer(pred, add_special_tokens=False).input_ids)
         match = _normalize(pred) == _normalize(ex["output"])
@@ -107,8 +107,9 @@ def _worker(config_path: str, data_prefix: str, result_file: str, skip_train: bo
     timing["eval_examples_per_sec"] = len(examples) / eval_runtime if eval_runtime else 0
     timing["eval_tokens_generated"] = eval_tokens
     timing["eval_tokens_per_sec"]   = eval_tokens / eval_runtime if eval_runtime else 0
-    if torch.cuda.is_available():
-        timing["eval_gpu_mem_peak_mb"] = torch.cuda.max_memory_allocated() / 1e6
+    eval_peak = backend.peak_memory_mb()
+    if eval_peak is not None:
+        timing["eval_gpu_mem_peak_mb"] = eval_peak
 
     total_ok = sum(sum(v) for v in cats.values())
     total    = sum(len(v) for v in cats.values())
@@ -236,12 +237,15 @@ def main() -> None:
     pa.add_argument("--skip-train",  action="store_true",
                      help="reuse each config's existing lora_adapter instead of retraining "
                           "(no train timing is recorded in this mode)")
+    pa.add_argument("--backend",     choices=["auto", "cuda", "mlx"], default="auto",
+                     help="compute backend (CUDA-only; mlx is unsupported for benchmark)")
     pa.add_argument("--_worker",     metavar="CONFIG", default=None, help=argparse.SUPPRESS)
     pa.add_argument("--result-file", default=None,                   help=argparse.SUPPRESS)
     args = pa.parse_args()
 
     if args._worker:
-        _worker(args._worker, args.data, args.result_file, skip_train=args.skip_train)
+        _worker(args._worker, args.data, args.result_file,
+                skip_train=args.skip_train, backend_name=args.backend)
         return
 
     if not args.configs:
@@ -263,7 +267,8 @@ def main() -> None:
         worker_cmd = [sys.executable, "-m", "lfm_train.benchmark",
                       "--_worker",     config_path,
                       "--data",        args.data,
-                      "--result-file", result_file]
+                      "--result-file", result_file,
+                      "--backend",     args.backend]
         if args.skip_train:
             worker_cmd.append("--skip-train")
         ret = subprocess.run(worker_cmd)
